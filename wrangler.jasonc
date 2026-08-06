@@ -1,0 +1,11 @@
+{
+  "name": "snowy-mountain-a401",
+  "main": "codepad.js",
+  "compatibility_date": "2026-08-02",
+  "kv_namespaces": [
+    {
+      "binding": "KV_BINDING",
+      "id": "bdd43ff8f3fa4e4dbef025fa1022d40f"
+    }
+  ]
+}
