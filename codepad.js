@@ -41,6 +41,40 @@ export default {
       return json(PAYMENT_CONFIG);
     }
 
+    // Free 3-day trial — one per phone number
+    if (path === "/api/start-trial" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.name || !body.phone) return json({ error: "Missing fields" }, 400);
+
+      const phone = body.phone.replace(/[^\d+]/g, "");
+      const trialMarkerKey = `trial-used:${phone}`;
+      const alreadyUsed = await env.KV_BINDING.get(trialMarkerKey);
+      if (alreadyUsed) {
+        return json({ error: "This phone number has already used its free trial." }, 400);
+      }
+
+      const subId = crypto.randomUUID();
+      const licenseKey = genLicenseKey();
+      const sub = {
+        id: subId,
+        name: body.name.trim(),
+        phone,
+        plan: "trial",
+        planDays: 3,
+        status: "approved",
+        createdAt: Date.now(),
+        approvedAt: Date.now(),
+        expiresAt: Date.now() + 3 * 24 * 60 * 60 * 1000,
+        licenseKey,
+        isTrial: true,
+      };
+      await env.KV_BINDING.put(`sub:${subId}`, JSON.stringify(sub));
+      await env.KV_BINDING.put(`license:${licenseKey}`, JSON.stringify(sub));
+      await env.KV_BINDING.put(trialMarkerKey, "1");
+
+      return json({ success: true, licenseKey });
+    }
+
     // Submit a subscription request (name/whatsapp/txnId) -> pending approval
     if (path === "/api/razorpay/create-link" && request.method === "POST") {
       const body = await request.json().catch(() => null);
@@ -577,7 +611,9 @@ const EDITOR_HTML = `<!DOCTYPE html>
     <div class="field"><label>Your name</label><input type="text" id="subName" placeholder="Full name"></div>
     <div class="field"><label>WhatsApp number (with country code)</label><input type="tel" id="subPhone" placeholder="+91XXXXXXXXXX"></div>
     <button class="btn-full" onclick="submitSubscription()">Pay with Razorpay</button>
+    <button class="btn-full" onclick="startFreeTrial()" style="background:transparent; border:1.5px solid var(--teal); color:var(--teal); margin-top:8px;">Start 3-Day Free Trial</button>
     <div class="success-msg" id="subSuccess">✓ Redirecting to payment...</div>
+    <div class="success-msg" id="trialSuccess"></div>
     <div class="lock-note">Already have a license key? <a href="#" onclick="openModal('license'); return false;" style="color:var(--teal);">Enter it here</a></div>
   </div>
 </div>
@@ -935,6 +971,28 @@ const EDITOR_HTML = `<!DOCTYPE html>
         document.getElementById('subSuccess').classList.add('show');
         window.location.href = data.paymentUrl;
       } else { alert('ERROR: ' + JSON.stringify(data)); }
+    }catch(e){ alert('Network error, please try again.'); }
+  }
+
+  async function startFreeTrial(){
+    const payload = {
+      name: document.getElementById('subName').value.trim(),
+      phone: document.getElementById('subPhone').value.trim(),
+    };
+    if(!payload.name || !payload.phone){ alert('Please fill in your name and WhatsApp number first.'); return; }
+    try{
+      const res = await fetch('/api/start-trial', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      const data = await res.json();
+      if(data.success && data.licenseKey){
+        licenseKey = data.licenseKey;
+        localStorage.setItem('codepad_license', data.licenseKey);
+        updatePlanBadge();
+        const msg = document.getElementById('trialSuccess');
+        msg.textContent = '✓ Trial activated! Your license key: ' + data.licenseKey + ' (valid 3 days, saved on this device)';
+        msg.classList.add('show');
+      } else {
+        alert(data.error || 'Could not start trial.');
+      }
     }catch(e){ alert('Network error, please try again.'); }
   }
 
