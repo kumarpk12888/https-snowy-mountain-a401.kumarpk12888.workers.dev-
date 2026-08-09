@@ -42,30 +42,91 @@ export default {
     }
 
     // Submit a subscription request (name/whatsapp/txnId) -> pending approval
-    if (path === "/api/subscribe" && request.method === "POST") {
+    if (path === "/api/razorpay/create-link" && request.method === "POST") {
       const body = await request.json().catch(() => null);
-      if (!body) return json({ error: "Invalid data" }, 400);
-      const required = ["name", "phone", "plan", "txnId"];
-      for (const f of required) {
-        if (!body[f] || String(body[f]).trim() === "") return json({ error: `${f} is required` }, 400);
-      }
-      const id = crypto.randomUUID();
+      if (!body || !body.plan || !body.name || !body.phone) return json({ error: "Missing fields" }, 400);
+
+      const amountINR = body.plan === "yearly" ? PAYMENT_CONFIG.yearlyFeeINR : PAYMENT_CONFIG.monthlyFeeINR;
+      const subId = crypto.randomUUID();
       const planDays = body.plan === "yearly" ? 365 : 30;
-      const sub = {
-        id,
+
+      const pendingSub = {
+        id: subId,
         name: body.name.trim(),
         phone: body.phone.replace(/[^\d+]/g, ""),
         plan: body.plan,
-        txnId: body.txnId.trim(),
-        status: "pending",
-        createdAt: Date.now(),
-        approvedAt: null,
-        expiresAt: null,
         planDays,
-        licenseKey: null,
+        status: "awaiting_payment",
+        createdAt: Date.now(),
       };
-      await env.KV_BINDING.put(`sub:${id}`, JSON.stringify(sub));
-      return json({ success: true });
+      await env.KV_BINDING.put(`sub:${subId}`, JSON.stringify(pendingSub));
+
+      const auth = "Basic " + btoa(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`);
+      const callbackUrl = `${url.origin}/payment-return?subId=${subId}`;
+
+      const rzpRes = await fetch("https://api.razorpay.com/v1/payment_links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": auth },
+        body: JSON.stringify({
+          amount: amountINR * 100,
+          currency: "INR",
+          accept_partial: false,
+          description: `CodePad Pro — ${body.plan} plan`,
+          reference_id: subId,
+          customer: { name: pendingSub.name, contact: pendingSub.phone || undefined },
+          notify: { sms: false, email: false },
+          callback_url: callbackUrl,
+          callback_method: "get",
+        }),
+      });
+
+      const rzpRawText = await rzpRes.text();
+      let rzpData = null;
+      try { rzpData = JSON.parse(rzpRawText); } catch (e) {}
+
+      if (!rzpRes.ok || !rzpData || !rzpData.short_url) {
+        return json({ error: "Could not create payment link", status: rzpRes.status, raw: rzpRawText.slice(0, 500) }, 500);
+      }
+
+      pendingSub.paymentLinkId = rzpData.id;
+      await env.KV_BINDING.put(`sub:${subId}`, JSON.stringify(pendingSub));
+
+      return json({ success: true, paymentUrl: rzpData.short_url, subId });
+    }
+
+    if (path === "/api/razorpay/verify" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.subId) return json({ error: "Missing subId" }, 400);
+
+      const raw = await env.KV_BINDING.get(`sub:${body.subId}`);
+      if (!raw) return json({ error: "Not found" }, 404);
+      const pending = JSON.parse(raw);
+      if (!pending.paymentLinkId) return json({ error: "No payment link" }, 400);
+
+      const auth = "Basic " + btoa(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`);
+      const rzpRes = await fetch(`https://api.razorpay.com/v1/payment_links/${pending.paymentLinkId}`, {
+        headers: { "Authorization": auth },
+      });
+      const rzpData = await rzpRes.json().catch(() => null);
+      if (!rzpRes.ok || !rzpData) return json({ paid: false });
+
+      if (rzpData.status === "paid") {
+        const existing = await env.KV_BINDING.get(`sub:${pending.id}`);
+        const sub = existing ? JSON.parse(existing) : pending;
+        if (sub.status !== "approved") {
+          sub.status = "approved";
+          sub.approvedAt = Date.now();
+          sub.expiresAt = Date.now() + (sub.planDays || 30) * 24 * 60 * 60 * 1000;
+          sub.txnId = rzpData.id;
+          sub.paymentVerified = true;
+          if (!sub.licenseKey) sub.licenseKey = genLicenseKey();
+          await env.KV_BINDING.put(`sub:${sub.id}`, JSON.stringify(sub));
+          await env.KV_BINDING.put(`license:${sub.licenseKey}`, JSON.stringify(sub));
+        }
+        return json({ paid: true, licenseKey: sub.licenseKey });
+      }
+
+      return json({ paid: false, status: rzpData.status });
     }
 
     // Check a license key -> returns valid true/false + expiry
@@ -247,6 +308,13 @@ export default {
     // FRONTEND PAGES
     // =========================================================
 
+    if (path === "/payment-return") {
+      const subId = url.searchParams.get("subId") || "";
+      return new Response(PAYMENT_RETURN_HTML.replace("__SUB_ID__", subId), {
+        headers: { "content-type": "text/html;charset=UTF-8" },
+      });
+    }
+
     if (path === "/admin" || path === "/admin/") {
       return new Response(ADMIN_HTML, { headers: { "content-type": "text/html;charset=UTF-8" } });
     }
@@ -289,6 +357,65 @@ function genLicenseKey() {
 // =========================================================
 // EDITOR PAGE HTML
 // =========================================================
+// =========================================================
+// PAYMENT RETURN PAGE — verifies Razorpay payment, shows license key
+// =========================================================
+const PAYMENT_RETURN_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verifying payment — CodePad</title>
+<style>
+  body{ font-family:sans-serif; background:#0F1512; color:#EDF2EE; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; text-align:center; padding:20px; }
+  .box{ max-width:420px; }
+  h2{ color:#2FBF9F; }
+  .spinner{ width:36px; height:36px; border:4px solid #2A342E; border-top-color:#2FBF9F; border-radius:50%; margin:20px auto; animation:spin 0.8s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  a{ color:#2FBF9F; font-weight:600; }
+  .fail{ color:#E17C6E; }
+  .key-box{ background:#1D2620; border:1.5px solid #2FBF9F; border-radius:10px; padding:16px; margin-top:16px; font-family:monospace; font-size:18px; letter-spacing:1px; color:#E8B23B; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h2 id="title">Verifying your payment...</h2>
+  <div class="spinner" id="spinner"></div>
+  <p id="msg">Please wait a moment.</p>
+  <div id="keyBox" style="display:none;">
+    <div class="key-box" id="keyText"></div>
+    <p style="font-size:12px;color:#8FA098;margin-top:10px;">Save this license key — you'll need it to activate Pro in the app.</p>
+  </div>
+  <p><a href="/">Back to CodePad</a></p>
+</div>
+<script>
+  const subId = "__SUB_ID__";
+  async function verify(){
+    try{
+      const res = await fetch('/api/razorpay/verify', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({subId}) });
+      const data = await res.json();
+      document.getElementById('spinner').style.display='none';
+      if(data.paid){
+        document.getElementById('title').textContent = '✓ Payment successful!';
+        document.getElementById('msg').textContent = 'Your CodePad Pro license is ready:';
+        document.getElementById('keyBox').style.display = 'block';
+        document.getElementById('keyText').textContent = data.licenseKey;
+      } else {
+        document.getElementById('title').textContent = 'Payment not completed';
+        document.getElementById('title').className = 'fail';
+        document.getElementById('msg').textContent = 'If you completed the payment, please wait a minute and refresh this page.';
+      }
+    }catch(e){
+      document.getElementById('spinner').style.display='none';
+      document.getElementById('title').textContent = 'Something went wrong';
+      document.getElementById('msg').textContent = 'Please contact support if the amount was deducted.';
+    }
+  }
+  verify();
+</script>
+</body>
+</html>`;
+
 const EDITOR_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -332,7 +459,7 @@ const EDITOR_HTML = `<!DOCTYPE html>
   .tab{ padding:9px 18px; font-size:12.5px; font-weight:600; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; }
   .tab.active{ color:var(--ink); border-bottom-color:var(--teal); }
 
-  .layout{ display:flex; height:calc(100vh - 88px); flex-direction:column; }
+  .layout{ display:flex; height:calc(100vh - 128px); flex-direction:column; }
   @media(min-width:860px){ .layout{ flex-direction:row; } }
 
   .editor-pane{ flex:1; display:flex; flex-direction:column; min-height:0; }
@@ -388,6 +515,11 @@ const EDITOR_HTML = `<!DOCTYPE html>
   </div>
 </header>
 
+<div id="aboutBar" style="background:#161D19;border-bottom:1px solid #2A342E;padding:8px 14px;font-size:11.5px;color:#8FA098;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+  <span>CodePad is a browser-based HTML/CSS/JS code editor with live preview. Free to use — upgrade to <b style="color:#E8B23B;">Pro (₹49/mo or ₹399/yr)</b> for unlimited cloud-saved projects.</span>
+  <a href="#" onclick="openModal('about'); return false;" style="color:#2FBF9F; white-space:nowrap;">Learn more</a>
+</div>
+
 <div class="tabs">
   <div class="tab active" data-tab="html" onclick="switchTab('html')">HTML</div>
   <div class="tab" data-tab="css" onclick="switchTab('css')">CSS</div>
@@ -425,11 +557,10 @@ const EDITOR_HTML = `<!DOCTYPE html>
       </div>
     </div>
     <div class="pay-box" id="payBox">Loading payment details...</div>
-    <div class="field"><label>Payment transaction / reference ID</label><input type="text" id="subTxnId" placeholder="Paste your UPI transaction ID"></div>
     <div class="field"><label>Your name</label><input type="text" id="subName" placeholder="Full name"></div>
     <div class="field"><label>WhatsApp number (with country code)</label><input type="tel" id="subPhone" placeholder="+91XXXXXXXXXX"></div>
-    <button class="btn-full" onclick="submitSubscription()">Submit for approval</button>
-    <div class="success-msg" id="subSuccess">✓ Submitted! You'll receive your license key on WhatsApp once approved.</div>
+    <button class="btn-full" onclick="submitSubscription()">Pay with Razorpay</button>
+    <div class="success-msg" id="subSuccess">✓ Redirecting to payment...</div>
     <div class="lock-note">Already have a license key? <a href="#" onclick="openModal('license'); return false;" style="color:var(--teal);">Enter it here</a></div>
   </div>
 </div>
@@ -441,6 +572,21 @@ const EDITOR_HTML = `<!DOCTYPE html>
     <div class="field"><label>License key</label><input type="text" id="licenseInput" placeholder="XXXX-XXXX-XXXX"></div>
     <button class="btn-full" onclick="activateLicense()">Activate</button>
     <div class="success-msg" id="licenseMsg"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modalAbout">
+  <div class="modal">
+    <h2>About CodePad</h2>
+    <div style="font-size:13.5px; color:var(--muted); line-height:1.7; margin-top:10px;">
+      <p><b style="color:var(--ink);">What CodePad offers:</b> CodePad is a software-as-a-service (SaaS) web application that lets users write, test, and preview HTML, CSS, and JavaScript code directly in their browser — no installation required. It includes a live preview pane, syntax highlighting, a built-in console for viewing logs and errors, and the ability to export projects as a downloadable ZIP file.</p>
+      <p style="margin-top:10px;"><b style="color:var(--ink);">Pricing:</b><br>
+      Free: unlimited use of the code editor, live preview, console, and ZIP export.<br>
+      CodePad Pro — ₹49/month or ₹399/year: adds unlimited cloud-saved projects accessible from any device.</p>
+      <p style="margin-top:10px;"><b style="color:var(--ink);">Who it's for:</b> Students, developers, and hobbyists who want a quick, mobile-friendly way to write and test front-end code without setting up a local development environment.</p>
+      <p style="margin-top:10px;"><b style="color:var(--ink);">Contact:</b> kumarpk12888@gmail.com</p>
+    </div>
+    <button class="btn-full" onclick="closeAbout()" style="margin-top:16px;">Close</button>
   </div>
 </div>
 
@@ -457,6 +603,14 @@ const EDITOR_HTML = `<!DOCTYPE html>
   </div>
 </div>
 
+<script>
+  window.addEventListener('error', function(e){
+    var b = document.createElement('div');
+    b.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#C0392B;color:#fff;padding:12px;font-size:12px;z-index:9999;white-space:pre-wrap;';
+    b.textContent = 'JS ERROR: ' + e.message + ' (line ' + e.lineno + ')';
+    document.body.appendChild(b);
+  });
+</script>
 <script>
   let activeTab = 'html';
   let licenseKey = null;
@@ -544,13 +698,16 @@ const EDITOR_HTML = `<!DOCTYPE html>
     document.getElementById('modalUpgrade').classList.remove('open');
     document.getElementById('modalLicense').classList.remove('open');
     document.getElementById('modalProjects').classList.remove('open');
+    document.getElementById('modalAbout').classList.remove('open');
     if(name==='upgrade') document.getElementById('modalUpgrade').classList.add('open');
     if(name==='license') document.getElementById('modalLicense').classList.add('open');
+    if(name==='about') document.getElementById('modalAbout').classList.add('open');
     if(name==='projects'){
       document.getElementById('modalProjects').classList.add('open');
       refreshProjectsView();
     }
   }
+  function closeAbout(){ document.getElementById('modalAbout').classList.remove('open'); }
   document.querySelectorAll('.modal-overlay').forEach(ov => {
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.classList.remove('open'); });
   });
@@ -576,7 +733,7 @@ const EDITOR_HTML = `<!DOCTYPE html>
     if(!paymentConfig) return;
     const fee = selectedPlan==='monthly' ? paymentConfig.monthlyFeeINR : paymentConfig.yearlyFeeINR;
     document.getElementById('payBox').innerHTML =
-      '<b>Pay via UPI:</b> ' + paymentConfig.upiId + ' — ₹' + fee + '<br><br>After paying, paste your transaction ID below.';
+      '<b>Amount:</b> ₹' + fee + '<br><br>You\\'ll be redirected to Razorpay to pay securely via UPI, card, or netbanking. Your license activates automatically once payment is confirmed.';
   }
 
   async function submitSubscription(){
@@ -584,16 +741,15 @@ const EDITOR_HTML = `<!DOCTYPE html>
       name: document.getElementById('subName').value.trim(),
       phone: document.getElementById('subPhone').value.trim(),
       plan: selectedPlan,
-      txnId: document.getElementById('subTxnId').value.trim(),
     };
-    if(!payload.name || !payload.phone || !payload.txnId){ alert('Please fill in all fields.'); return; }
+    if(!payload.name || !payload.phone){ alert('Please fill in all fields.'); return; }
     try{
-      const res = await fetch('/api/subscribe', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      const res = await fetch('/api/razorpay/create-link', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
       const data = await res.json();
-      if(data.success){
+      if(data.success && data.paymentUrl){
         document.getElementById('subSuccess').classList.add('show');
-        ['subName','subPhone','subTxnId'].forEach(id=>document.getElementById(id).value='');
-      } else { alert(data.error || 'Something went wrong.'); }
+        window.location.href = data.paymentUrl;
+      } else { alert('ERROR: ' + JSON.stringify(data)); }
     }catch(e){ alert('Network error, please try again.'); }
   }
 
@@ -783,7 +939,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       return \`<div class="item">
         <div class="item-top"><b>\${s.name}</b><span class="badge \${st}">\${st}</span></div>
         <div class="meta">WhatsApp: \${s.phone} · Plan: \${s.plan}<br>Submitted: \${new Date(s.createdAt).toLocaleDateString()}</div>
-        <div class="txn">Txn ID: \${s.txnId}</div>
+        <div class="txn">\${s.paymentVerified ? '✓ Razorpay Verified — ' + s.txnId : 'Txn ID: ' + s.txnId}</div>
         \${s.licenseKey ? '<div class="txn key">License: '+s.licenseKey+'</div>' : ''}
         <div class="actions">
           \${st==='pending' ? '<button class="a-approve" onclick="act(\\'approve\\',\\''+s.id+'\\')">Approve</button><button class="a-reject" onclick="act(\\'reject\\',\\''+s.id+'\\')">Reject</button>' : ''}
