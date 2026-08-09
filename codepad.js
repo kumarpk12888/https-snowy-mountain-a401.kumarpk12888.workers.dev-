@@ -441,6 +441,11 @@ const EDITOR_HTML = `<!DOCTYPE html>
     --bg:#0F1512; --panel:#161D19; --panel2:#1D2620; --ink:#EDF2EE;
     --teal:#2FBF9F; --amber:#E8B23B; --line:#2A342E; --muted:#8FA098;
   }
+  body.light-theme{
+    --bg:#F7F4EC; --panel:#FFFDF8; --panel2:#F1E9D8; --ink:#16211F;
+    --teal:#0F7A5F; --amber:#C9971B; --line:#DCD5C2; --muted:#6A756F;
+  }
+  body.light-theme .CodeMirror{ background:#FFFDF8 !important; }
   *{box-sizing:border-box; margin:0; padding:0;}
   body{ background:var(--bg); color:var(--ink); font-family:'IBM Plex Sans', sans-serif; height:100vh; overflow:hidden; }
   .mono{ font-family:'IBM Plex Mono', monospace; }
@@ -459,7 +464,7 @@ const EDITOR_HTML = `<!DOCTYPE html>
   .tab{ padding:9px 18px; font-size:12.5px; font-weight:600; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; }
   .tab.active{ color:var(--ink); border-bottom-color:var(--teal); }
 
-  .layout{ display:flex; height:calc(100vh - 128px); flex-direction:column; }
+  .layout{ display:flex; height:calc(100vh - 168px); flex-direction:column; }
   @media(min-width:860px){ .layout{ flex-direction:row; } }
 
   .editor-pane{ flex:1; display:flex; flex-direction:column; min-height:0; }
@@ -509,6 +514,9 @@ const EDITOR_HTML = `<!DOCTYPE html>
   <div class="logo"><span class="dot"></span>CodePad</div>
   <div class="header-actions">
     <span class="badge free" id="planBadge">Free</span>
+    <button class="icon-btn" onclick="toggleTheme()" id="themeBtn" title="Toggle theme">☀️</button>
+    <button class="icon-btn" onclick="openModal('templates')">Templates</button>
+    <button class="icon-btn" onclick="shareCode()">Share</button>
     <button class="icon-btn" onclick="exportZip()">Export</button>
     <button class="icon-btn" onclick="openModal('projects')">Projects</button>
     <button class="icon-btn primary" onclick="openModal('upgrade')">Upgrade</button>
@@ -516,7 +524,7 @@ const EDITOR_HTML = `<!DOCTYPE html>
 </header>
 
 <div id="aboutBar" style="background:#161D19;border-bottom:1px solid #2A342E;padding:8px 14px;font-size:11.5px;color:#8FA098;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
-  <span>CodePad is a browser-based HTML/CSS/JS code editor with live preview. Free to use — upgrade to <b style="color:#E8B23B;">Pro (₹49/mo or ₹399/yr)</b> for unlimited cloud-saved projects.</span>
+  <span>CodePad is a browser-based HTML/CSS/JS code editor with live preview, templates, auto-save, and share links. Free to use — upgrade to <b style="color:#E8B23B;">Pro (₹49/mo or ₹399/yr)</b> for unlimited cloud-saved projects.</span>
   <a href="#" onclick="openModal('about'); return false;" style="color:#2FBF9F; white-space:nowrap;">Learn more</a>
 </div>
 
@@ -524,6 +532,15 @@ const EDITOR_HTML = `<!DOCTYPE html>
   <div class="tab active" data-tab="html" onclick="switchTab('html')">HTML</div>
   <div class="tab" data-tab="css" onclick="switchTab('css')">CSS</div>
   <div class="tab" data-tab="js" onclick="switchTab('js')">JS</div>
+  <div style="margin-left:auto; display:flex; align-items:center; padding-right:10px;">
+    <label style="font-size:10px; color:#8FA098; display:flex; align-items:center; gap:4px; cursor:pointer;">
+      <input type="file" id="imageUploadInput" accept="image/*" style="display:none;" onchange="handleImageUpload(event)">
+      <button class="icon-btn" onclick="document.getElementById('imageUploadInput').click()" style="padding:4px 8px; font-size:10px;">🖼️ Image</button>
+    </label>
+  </div>
+</div>
+
+<div id="symbolToolbar" style="display:flex; gap:6px; overflow-x:auto; padding:6px 10px; background:#161D19; border-bottom:1px solid #2A342E;">
 </div>
 
 <div class="layout">
@@ -578,15 +595,40 @@ const EDITOR_HTML = `<!DOCTYPE html>
 <div class="modal-overlay" id="modalAbout">
   <div class="modal">
     <h2>About CodePad</h2>
-    <div style="font-size:13.5px; color:var(--muted); line-height:1.7; margin-top:10px;">
-      <p><b style="color:var(--ink);">What CodePad offers:</b> CodePad is a software-as-a-service (SaaS) web application that lets users write, test, and preview HTML, CSS, and JavaScript code directly in their browser — no installation required. It includes a live preview pane, syntax highlighting, a built-in console for viewing logs and errors, and the ability to export projects as a downloadable ZIP file.</p>
+    <div style="font-size:13.5px; color:var(--muted); line-height:1.7; margin-top:10px; max-height:60vh; overflow-y:auto;">
+      <p><b style="color:var(--ink);">What CodePad offers:</b> CodePad is a software-as-a-service (SaaS) web application that lets users write, test, and preview HTML, CSS, and JavaScript code directly in their browser — no installation required.</p>
+      <p style="margin-top:10px;"><b style="color:var(--ink);">Features:</b><br>
+      💻 Live preview — see changes update in real time<br>
+      🎨 Syntax highlighting with Dark and Light theme options<br>
+      🖥️ Built-in console for logs, warnings, and errors<br>
+      📚 Starter templates — Landing Page, Contact Form, Card Layout, To-Do List, and more<br>
+      💾 Auto-save — code is saved automatically as you type, no account needed<br>
+      🔗 Share with a link — generate a shareable link that opens your exact code for anyone<br>
+      🖼️ Image support — upload images directly into your project<br>
+      ⌨️ Mobile-friendly symbol toolbar for fast coding on a phone keyboard<br>
+      📦 Export your code as a downloadable ZIP file<br>
+      ☁️ Cloud save (Pro) — unlimited projects saved to the cloud, accessible from any device</p>
       <p style="margin-top:10px;"><b style="color:var(--ink);">Pricing:</b><br>
-      Free: unlimited use of the code editor, live preview, console, and ZIP export.<br>
+      Free: unlimited use of the code editor, live preview, console, templates, auto-save, share links, and ZIP export.<br>
       CodePad Pro — ₹49/month or ₹399/year: adds unlimited cloud-saved projects accessible from any device.</p>
       <p style="margin-top:10px;"><b style="color:var(--ink);">Who it's for:</b> Students, developers, and hobbyists who want a quick, mobile-friendly way to write and test front-end code without setting up a local development environment.</p>
       <p style="margin-top:10px;"><b style="color:var(--ink);">Contact:</b> kumarpk12888@gmail.com</p>
     </div>
     <button class="btn-full" onclick="closeAbout()" style="margin-top:16px;">Close</button>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modalTemplates">
+  <div class="modal">
+    <h2>Starter Templates</h2>
+    <div style="margin-top:14px; display:flex; flex-direction:column; gap:8px;">
+      <button class="icon-btn" style="width:100%; text-align:left; padding:12px;" onclick="loadTemplate('blank')">📄 Blank</button>
+      <button class="icon-btn" style="width:100%; text-align:left; padding:12px;" onclick="loadTemplate('landing')">🚀 Landing Page</button>
+      <button class="icon-btn" style="width:100%; text-align:left; padding:12px;" onclick="loadTemplate('form')">📝 Contact Form</button>
+      <button class="icon-btn" style="width:100%; text-align:left; padding:12px;" onclick="loadTemplate('card')">🃏 Card Layout</button>
+      <button class="icon-btn" style="width:100%; text-align:left; padding:12px;" onclick="loadTemplate('todo')">✅ To-Do List (JS)</button>
+    </div>
+    <button class="btn-full" onclick="closeTemplates()" style="margin-top:16px;">Close</button>
   </div>
 </div>
 
@@ -631,6 +673,147 @@ const EDITOR_HTML = `<!DOCTYPE html>
     document.querySelectorAll('.code-area').forEach(a => a.classList.remove('active'));
     document.getElementById('area-'+tab).classList.add('active');
     setTimeout(()=>{ [cmHtml,cmCss,cmJs].forEach(cm=>cm.refresh()); }, 10);
+  }
+
+  // ===== THEME TOGGLE =====
+  function toggleTheme(){
+    const isLight = document.body.classList.toggle('light-theme');
+    localStorage.setItem('codepad_theme', isLight ? 'light' : 'dark');
+    const cmTheme = isLight ? 'default' : 'dracula';
+    [cmHtml, cmCss, cmJs].forEach(cm => cm.setOption('theme', cmTheme));
+    document.getElementById('themeBtn').textContent = isLight ? '🌙' : '☀️';
+  }
+  function restoreTheme(){
+    if(localStorage.getItem('codepad_theme') === 'light'){ toggleTheme(); }
+  }
+
+  // ===== TEMPLATES =====
+  const TEMPLATES = {
+    blank: { html: '', css: '', js: '' },
+    landing: {
+      html: '<div class="hero">\\n  <h1>Welcome to MyBrand</h1>\\n  <p>A simple landing page starter.</p>\\n  <button>Get Started</button>\\n</div>',
+      css: 'body{ font-family:sans-serif; margin:0; }\\n.hero{ text-align:center; padding:80px 20px; background:#0F3D3E; color:#fff; }\\n.hero button{ padding:12px 28px; border:none; border-radius:6px; background:#C9971B; color:#3A2C05; font-weight:700; margin-top:16px; cursor:pointer; }',
+      js: 'document.querySelector("button").addEventListener("click", () => alert("Let\\'s go!"));'
+    },
+    form: {
+      html: '<form id="contactForm">\\n  <label>Name</label>\\n  <input type="text" id="name" required>\\n  <label>Email</label>\\n  <input type="email" id="email" required>\\n  <label>Message</label>\\n  <textarea id="message" rows="4"></textarea>\\n  <button type="submit">Send</button>\\n</form>',
+      css: 'body{ font-family:sans-serif; padding:20px; }\\nform{ display:flex; flex-direction:column; gap:8px; max-width:320px; }\\ninput, textarea{ padding:8px; border:1px solid #ccc; border-radius:4px; }\\nbutton{ padding:10px; background:#2FBF9F; color:#fff; border:none; border-radius:4px; }',
+      js: 'document.getElementById("contactForm").addEventListener("submit", function(e){\\n  e.preventDefault();\\n  alert("Thanks, " + document.getElementById("name").value + "!");\\n});'
+    },
+    card: {
+      html: '<div class="card">\\n  <h2>Card Title</h2>\\n  <p>Some quick example text for this card.</p>\\n  <a href="#">Read more</a>\\n</div>',
+      css: 'body{ font-family:sans-serif; padding:20px; background:#f4f4f4; }\\n.card{ background:#fff; border-radius:8px; padding:20px; max-width:320px; box-shadow:0 2px 8px rgba(0,0,0,0.1); }\\n.card a{ color:#2FBF9F; font-weight:600; text-decoration:none; }',
+      js: ''
+    },
+    todo: {
+      html: '<h2>To-Do List</h2>\\n<input id="taskInput" placeholder="Add a task...">\\n<button id="addBtn">Add</button>\\n<ul id="taskList"></ul>',
+      css: 'body{ font-family:sans-serif; padding:20px; }\\nli{ margin:6px 0; }',
+      js: 'document.getElementById("addBtn").addEventListener("click", function(){\\n  const input = document.getElementById("taskInput");\\n  if(!input.value.trim()) return;\\n  const li = document.createElement("li");\\n  li.textContent = input.value;\\n  document.getElementById("taskList").appendChild(li);\\n  input.value = "";\\n});'
+    }
+  };
+  function loadTemplate(name){
+    const t = TEMPLATES[name];
+    if(!t) return;
+    cmHtml.setValue(t.html);
+    cmCss.setValue(t.css);
+    cmJs.setValue(t.js);
+    clearConsole();
+    runPreview();
+    closeTemplates();
+  }
+  function closeTemplates(){ document.getElementById('modalTemplates').classList.remove('open'); }
+
+  // ===== AUTO-SAVE (local draft) =====
+  function saveDraft(){
+    try{
+      localStorage.setItem('codepad_draft', JSON.stringify({ html: cmHtml.getValue(), css: cmCss.getValue(), js: cmJs.getValue() }));
+    }catch(e){}
+  }
+  function restoreDraft(){
+    try{
+      const raw = localStorage.getItem('codepad_draft');
+      if(!raw) return false;
+      const d = JSON.parse(raw);
+      cmHtml.setValue(d.html || '');
+      cmCss.setValue(d.css || '');
+      cmJs.setValue(d.js || '');
+      return true;
+    }catch(e){ return false; }
+  }
+
+  // ===== SYMBOL TOOLBAR (mobile-friendly quick insert) =====
+  const SYMBOLS = ['<', '>', '/', '"', "'", '{', '}', '(', ')', ';', ':', '=', '#', '.'];
+  function buildSymbolToolbar(){
+    const bar = document.getElementById('symbolToolbar');
+    bar.innerHTML = SYMBOLS.map(s => '<button class="icon-btn" style="padding:4px 10px; font-family:monospace; flex-shrink:0;" onclick="insertSymbol(' + JSON.stringify(s) + ')">' + s.replace('<','&lt;').replace('>','&gt;') + '</button>').join('');
+  }
+  function insertSymbol(sym){
+    const cm = activeTab === 'html' ? cmHtml : activeTab === 'css' ? cmCss : cmJs;
+    cm.replaceSelection(sym);
+    cm.focus();
+  }
+
+  // ===== IMAGE UPLOAD (base64 embed) =====
+  function handleImageUpload(event){
+    const file = event.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = function(e){
+      const imgTag = '<img src="' + e.target.result + '" alt="' + file.name + '" style="max-width:100%;">';
+      cmHtml.replaceSelection(imgTag);
+      switchTab('html');
+      runPreview();
+    };
+    reader.readAsDataURL(file);
+    event.target.value = '';
+  }
+
+  // ===== SHARE LINK =====
+  function shareCode(){
+    try{
+      const data = { h: cmHtml.getValue(), c: cmCss.getValue(), j: cmJs.getValue() };
+      const encoded = btoa(encodeURIComponent(JSON.stringify(data)));
+      const shareUrl = window.location.origin + '/#code=' + encoded;
+      if(navigator.clipboard){
+        navigator.clipboard.writeText(shareUrl).then(()=> alert('Share link copied to clipboard!'));
+      } else {
+        prompt('Copy this share link:', shareUrl);
+      }
+    }catch(e){ alert('Could not create share link (code may be too large).'); }
+  }
+  function loadFromShareLink(){
+    if(!window.location.hash.startsWith('#code=')) return false;
+    try{
+      const encoded = window.location.hash.slice(6);
+      const data = JSON.parse(decodeURIComponent(atob(encoded)));
+      cmHtml.setValue(data.h || '');
+      cmCss.setValue(data.c || '');
+      cmJs.setValue(data.j || '');
+      return true;
+    }catch(e){ return false; }
+  }
+
+  // ===== KEYBOARD SHORTCUTS =====
+  document.addEventListener('keydown', function(e){
+    if((e.ctrlKey || e.metaKey) && e.key === 's'){
+      e.preventDefault();
+      saveDraft();
+      const btn = document.getElementById('themeBtn');
+      const old = btn.textContent;
+      alertSaved();
+    }
+    if((e.ctrlKey || e.metaKey) && e.key === 'Enter'){
+      e.preventDefault();
+      clearConsole();
+      runPreview();
+    }
+  });
+  function alertSaved(){
+    const b = document.createElement('div');
+    b.textContent = 'Draft saved locally';
+    b.style.cssText = 'position:fixed; bottom:130px; left:50%; transform:translateX(-50%); background:#2FBF9F; color:#0A2B22; padding:8px 16px; border-radius:20px; font-size:12px; z-index:9999;';
+    document.body.appendChild(b);
+    setTimeout(()=> b.remove(), 1500);
   }
 
   const consoleCaptureScript = \`
@@ -699,9 +882,11 @@ const EDITOR_HTML = `<!DOCTYPE html>
     document.getElementById('modalLicense').classList.remove('open');
     document.getElementById('modalProjects').classList.remove('open');
     document.getElementById('modalAbout').classList.remove('open');
+    document.getElementById('modalTemplates').classList.remove('open');
     if(name==='upgrade') document.getElementById('modalUpgrade').classList.add('open');
     if(name==='license') document.getElementById('modalLicense').classList.add('open');
     if(name==='about') document.getElementById('modalAbout').classList.add('open');
+    if(name==='templates') document.getElementById('modalTemplates').classList.add('open');
     if(name==='projects'){
       document.getElementById('modalProjects').classList.add('open');
       refreshProjectsView();
@@ -845,10 +1030,19 @@ const EDITOR_HTML = `<!DOCTYPE html>
     }catch(e){}
   }
 
+  buildSymbolToolbar();
+  restoreTheme();
+  const hadShareLink = loadFromShareLink();
+  if(!hadShareLink) restoreDraft();
   runPreview();
   loadPaymentConfig();
   restoreLicense();
   setTimeout(()=>{ [cmHtml,cmCss,cmJs].forEach(cm=>cm.refresh()); }, 100);
+
+  const debouncedSaveDraft = debounce(saveDraft, 1000);
+  cmHtml.on('change', debouncedSaveDraft);
+  cmCss.on('change', debouncedSaveDraft);
+  cmJs.on('change', debouncedSaveDraft);
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(()=>{});
