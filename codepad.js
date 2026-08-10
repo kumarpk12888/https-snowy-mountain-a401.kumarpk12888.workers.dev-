@@ -680,14 +680,6 @@ const EDITOR_HTML = `<!DOCTYPE html>
 </div>
 
 <script>
-  window.addEventListener('error', function(e){
-    var b = document.createElement('div');
-    b.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#C0392B;color:#fff;padding:12px;font-size:12px;z-index:9999;white-space:pre-wrap;';
-    b.textContent = 'JS ERROR: ' + e.message + ' (line ' + e.lineno + ')';
-    document.body.appendChild(b);
-  });
-</script>
-<script>
   let activeTab = 'html';
   let licenseKey = null;
   let paymentConfig = null;
