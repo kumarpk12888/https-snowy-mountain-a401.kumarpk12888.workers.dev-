@@ -30,7 +30,332 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
-    return new Response("stub");
+
+    // =========================================================
+    // PUBLIC API
+    // =========================================================
+
+    if (path === "/api/payment-config" && request.method === "GET") {
+      return json(PAYMENT_CONFIG);
+    }
+
+    // Free 3-day trial — one per phone number
+    if (path === "/api/start-trial" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.name || !body.phone) return json({ error: "Missing fields" }, 400);
+
+      const phone = body.phone.replace(/[^\d+]/g, "");
+      const trialMarkerKey = `trial-used:${phone}`;
+      const alreadyUsed = await env.KV_BINDING.get(trialMarkerKey);
+      if (alreadyUsed) {
+        return json({ error: "This phone number has already used its free trial." }, 400);
+      }
+
+      const subId = crypto.randomUUID();
+      const licenseKey = genLicenseKey();
+      const sub = {
+        id: subId,
+        name: body.name.trim(),
+        phone,
+        plan: "trial",
+        planDays: 3,
+        status: "approved",
+        createdAt: Date.now(),
+        approvedAt: Date.now(),
+        expiresAt: Date.now() + 3 * 24 * 60 * 60 * 1000,
+        licenseKey,
+        isTrial: true,
+      };
+      await env.KV_BINDING.put(`sub:${subId}`, JSON.stringify(sub));
+      await env.KV_BINDING.put(`license:${licenseKey}`, JSON.stringify(sub));
+      await env.KV_BINDING.put(trialMarkerKey, "1");
+
+      return json({ success: true, licenseKey });
+    }
+
+    // Submit a subscription request (name/whatsapp/txnId) -> pending approval
+    if (path === "/api/razorpay/create-link" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.plan || !body.name || !body.phone) return json({ error: "Missing fields" }, 400);
+
+      const amountINR = body.plan === "yearly" ? PAYMENT_CONFIG.yearlyFeeINR : PAYMENT_CONFIG.monthlyFeeINR;
+      const subId = crypto.randomUUID();
+      const planDays = body.plan === "yearly" ? 365 : 30;
+
+      const pendingSub = {
+        id: subId,
+        name: body.name.trim(),
+        phone: body.phone.replace(/[^\d+]/g, ""),
+        plan: body.plan,
+        planDays,
+        status: "awaiting_payment",
+        createdAt: Date.now(),
+      };
+      await env.KV_BINDING.put(`sub:${subId}`, JSON.stringify(pendingSub));
+
+      const auth = "Basic " + btoa(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`);
+      const callbackUrl = `${url.origin}/payment-return?subId=${subId}`;
+
+      const rzpRes = await fetch("https://api.razorpay.com/v1/payment_links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": auth },
+        body: JSON.stringify({
+          amount: amountINR * 100,
+          currency: "INR",
+          accept_partial: false,
+          description: `CodePad Pro — ${body.plan} plan`,
+          reference_id: subId,
+          customer: { name: pendingSub.name, contact: pendingSub.phone || undefined },
+          notify: { sms: false, email: false },
+          callback_url: callbackUrl,
+          callback_method: "get",
+        }),
+      });
+
+      const rzpRawText = await rzpRes.text();
+      let rzpData = null;
+      try { rzpData = JSON.parse(rzpRawText); } catch (e) {}
+
+      if (!rzpRes.ok || !rzpData || !rzpData.short_url) {
+        return json({ error: "Could not create payment link", status: rzpRes.status, raw: rzpRawText.slice(0, 500) }, 500);
+      }
+
+      pendingSub.paymentLinkId = rzpData.id;
+      await env.KV_BINDING.put(`sub:${subId}`, JSON.stringify(pendingSub));
+
+      return json({ success: true, paymentUrl: rzpData.short_url, subId });
+    }
+
+    if (path === "/api/razorpay/verify" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.subId) return json({ error: "Missing subId" }, 400);
+
+      const raw = await env.KV_BINDING.get(`sub:${body.subId}`);
+      if (!raw) return json({ error: "Not found" }, 404);
+      const pending = JSON.parse(raw);
+      if (!pending.paymentLinkId) return json({ error: "No payment link" }, 400);
+
+      const auth = "Basic " + btoa(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`);
+      const rzpRes = await fetch(`https://api.razorpay.com/v1/payment_links/${pending.paymentLinkId}`, {
+        headers: { "Authorization": auth },
+      });
+      const rzpData = await rzpRes.json().catch(() => null);
+      if (!rzpRes.ok || !rzpData) return json({ paid: false });
+
+      if (rzpData.status === "paid") {
+        const existing = await env.KV_BINDING.get(`sub:${pending.id}`);
+        const sub = existing ? JSON.parse(existing) : pending;
+        if (sub.status !== "approved") {
+          sub.status = "approved";
+          sub.approvedAt = Date.now();
+          sub.expiresAt = Date.now() + (sub.planDays || 30) * 24 * 60 * 60 * 1000;
+          sub.txnId = rzpData.id;
+          sub.paymentVerified = true;
+          if (!sub.licenseKey) sub.licenseKey = genLicenseKey();
+          await env.KV_BINDING.put(`sub:${sub.id}`, JSON.stringify(sub));
+          await env.KV_BINDING.put(`license:${sub.licenseKey}`, JSON.stringify(sub));
+        }
+        return json({ paid: true, licenseKey: sub.licenseKey });
+      }
+
+      return json({ paid: false, status: rzpData.status });
+    }
+
+    // Check a license key -> returns valid true/false + expiry
+    if (path === "/api/check-license" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.key) return json({ valid: false });
+      const raw = await env.KV_BINDING.get(`license:${body.key}`);
+      if (!raw) return json({ valid: false });
+      const sub = JSON.parse(raw);
+      const valid = sub.status === "approved" && sub.expiresAt > Date.now();
+      return json({ valid, expiresAt: sub.expiresAt || null, name: sub.name || null });
+    }
+
+    // Save a project under a license key (cloud save, paid feature)
+    if (path === "/api/project/save" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.key || !body.name) return json({ error: "Missing data" }, 400);
+      const raw = await env.KV_BINDING.get(`license:${body.key}`);
+      if (!raw) return json({ error: "Invalid license" }, 401);
+      const sub = JSON.parse(raw);
+      if (sub.status !== "approved" || sub.expiresAt < Date.now()) return json({ error: "Subscription expired" }, 401);
+
+      const projectId = body.id || crypto.randomUUID();
+      const project = {
+        id: projectId,
+        name: body.name,
+        html: body.html || "",
+        css: body.css || "",
+        js: body.js || "",
+        updatedAt: Date.now(),
+      };
+      await env.KV_BINDING.put(`project:${body.key}:${projectId}`, JSON.stringify(project));
+      return json({ success: true, id: projectId });
+    }
+
+    // List projects for a license key
+    if (path === "/api/project/list" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.key) return json({ error: "Missing key" }, 400);
+      const list = await env.KV_BINDING.list({ prefix: `project:${body.key}:` });
+      const all = await Promise.all(
+        list.keys.map(async (k) => {
+          const v = await env.KV_BINDING.get(k.name);
+          return v ? JSON.parse(v) : null;
+        })
+      );
+      return json(all.filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt));
+    }
+
+    // Delete a project
+    if (path === "/api/project/delete" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.key || !body.id) return json({ error: "Missing data" }, 400);
+      await env.KV_BINDING.delete(`project:${body.key}:${body.id}`);
+      return json({ success: true });
+    }
+
+    // =========================================================
+    // ADMIN API (password protected)
+    // =========================================================
+
+    if (path === "/api/admin/login" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
+      if (body.password === env.ADMIN_PASSWORD) return json({ success: true });
+      return json({ success: false, error: "Wrong password" }, 401);
+    }
+
+    if (path.startsWith("/api/admin/") && path !== "/api/admin/login") {
+      const authHeader = request.headers.get("x-admin-password") || "";
+      if (authHeader !== env.ADMIN_PASSWORD) return json({ error: "Unauthorized" }, 401);
+    }
+
+    if (path === "/api/admin/subs" && request.method === "GET") {
+      const list = await env.KV_BINDING.list({ prefix: "sub:" });
+      const all = await Promise.all(
+        list.keys.map(async (k) => {
+          const v = await env.KV_BINDING.get(k.name);
+          return v ? JSON.parse(v) : null;
+        })
+      );
+      return json(all.filter(Boolean).sort((a, b) => b.createdAt - a.createdAt));
+    }
+
+    if (path === "/api/admin/approve" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.id) return json({ error: "Missing id" }, 400);
+      const key = `sub:${body.id}`;
+      const existing = await env.KV_BINDING.get(key);
+      if (!existing) return json({ error: "Not found" }, 404);
+      const sub = JSON.parse(existing);
+      sub.status = "approved";
+      sub.approvedAt = Date.now();
+      sub.expiresAt = Date.now() + (sub.planDays || 30) * DAY_MS;
+      if (!sub.licenseKey) sub.licenseKey = genLicenseKey();
+      await env.KV_BINDING.put(key, JSON.stringify(sub));
+      await env.KV_BINDING.put(`license:${sub.licenseKey}`, JSON.stringify(sub));
+      return json({ success: true, sub });
+    }
+
+    if (path === "/api/admin/reject" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.id) return json({ error: "Missing id" }, 400);
+      const key = `sub:${body.id}`;
+      const existing = await env.KV_BINDING.get(key);
+      if (!existing) return json({ error: "Not found" }, 404);
+      const sub = JSON.parse(existing);
+      sub.status = "rejected";
+      await env.KV_BINDING.put(key, JSON.stringify(sub));
+      return json({ success: true });
+    }
+
+    if (path === "/api/admin/renew" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.id) return json({ error: "Missing id" }, 400);
+      const key = `sub:${body.id}`;
+      const existing = await env.KV_BINDING.get(key);
+      if (!existing) return json({ error: "Not found" }, 404);
+      const sub = JSON.parse(existing);
+      const base = sub.expiresAt && sub.expiresAt > Date.now() ? sub.expiresAt : Date.now();
+      sub.expiresAt = base + (sub.planDays || 30) * DAY_MS;
+      sub.status = "approved";
+      if (!sub.licenseKey) sub.licenseKey = genLicenseKey();
+      await env.KV_BINDING.put(key, JSON.stringify(sub));
+      await env.KV_BINDING.put(`license:${sub.licenseKey}`, JSON.stringify(sub));
+      return json({ success: true, sub });
+    }
+
+    if (path === "/api/admin/delete" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || !body.id) return json({ error: "Missing id" }, 400);
+      await env.KV_BINDING.delete(`sub:${body.id}`);
+      return json({ success: true });
+    }
+
+    // =========================================================
+    // PWA: MANIFEST, ICONS, SERVICE WORKER
+    // =========================================================
+
+    if (path === "/manifest.json") {
+      const manifest = {
+        name: "CodePad",
+        short_name: "CodePad",
+        description: "Write and preview HTML, CSS, and JS live — anywhere.",
+        start_url: "/",
+        scope: "/",
+        display: "standalone",
+        background_color: "#0F1512",
+        theme_color: "#0F1512",
+        orientation: "portrait",
+        icons: [
+          { src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
+          { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
+        ],
+      };
+      return new Response(JSON.stringify(manifest), {
+        headers: { "content-type": "application/manifest+json" },
+      });
+    }
+
+    if (path === "/icon-192.png") {
+      return new Response(base64ToBytes(ICON_192_B64), {
+        headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" },
+      });
+    }
+
+    if (path === "/icon-512.png") {
+      return new Response(base64ToBytes(ICON_512_B64), {
+        headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" },
+      });
+    }
+
+    if (path === "/sw.js") {
+      return new Response(SERVICE_WORKER_JS, {
+        headers: { "content-type": "application/javascript" },
+      });
+    }
+
+    // =========================================================
+    // FRONTEND PAGES
+    // =========================================================
+
+    if (path === "/payment-return") {
+      const subId = url.searchParams.get("subId") || "";
+      return new Response(PAYMENT_RETURN_HTML.replace("__SUB_ID__", subId), {
+        headers: { "content-type": "text/html;charset=UTF-8" },
+      });
+    }
+
+    if (path === "/admin" || path === "/admin/") {
+      return new Response(ADMIN_HTML, { headers: { "content-type": "text/html;charset=UTF-8" } });
+    }
+
+    if (path === "/" || path === "") {
+      return new Response(EDITOR_HTML, { headers: { "content-type": "text/html;charset=UTF-8" } });
+    }
+
+    return new Response("Not found", { status: 404 });
   },
 };
 
